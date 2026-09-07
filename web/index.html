@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StitchWright — line art to embroidery files</title>
+    <meta
+      name="description"
+      content="Turn simple line-art PNGs into VP3, DST, PES and more — entirely in your browser. Your artwork is never uploaded."
+    />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%A7%B5%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="masthead">
+        <h1>StitchWright</h1>
+        <p class="tagline">
+          Turn a simple line drawing into a file your embroidery machine can stitch.
+        </p>
+        <p class="privacy">
+          Everything runs on your device. Your image is never uploaded.
+        </p>
+      </header>
+
+      <section class="panel" id="engine">
+        <div class="engine-row">
+          <span class="spinner" id="spinner" aria-hidden="true"></span>
+          <span id="status">Starting up&hellip;</span>
+        </div>
+        <p class="help" id="engine-hint">
+          The first visit downloads the converter (about 30&nbsp;MB). After that
+          it&rsquo;s saved on your device, loads instantly, and works offline.
+        </p>
+        <details id="logbox" hidden>
+          <summary>Show technical log</summary>
+          <pre id="log"></pre>
+        </details>
+      </section>
+
+      <section class="panel">
+        <label
+          class="dropzone"
+          id="drop"
+          for="file"
+          tabindex="0"
+          aria-label="Choose or drop a line drawing"
+        >
+          <input
+            type="file"
+            id="file"
+            accept="image/png,image/jpeg,image/webp,image/svg+xml,.svg"
+            hidden
+          />
+          <span id="drop-label">
+            <strong>Drop a line drawing here</strong>
+            <span>or click to choose &mdash; PNG, JPG, WebP or SVG</span>
+          </span>
+        </label>
+        <img id="source-thumb" alt="Selected artwork" hidden />
+      </section>
+
+      <section class="panel controls">
+        <div class="field">
+          <label for="stitch-type">Stitch style</label>
+          <select id="stitch-type">
+            <option value="running">Running</option>
+            <option value="satin">Satin</option>
+          </select>
+          <p class="help">
+            <strong>Running</strong> traces each line with a single row of
+            stitches &mdash; best for outlines, sketches and fine detail.
+            <strong>Satin</strong> fills each line with dense side-to-side
+            stitches for a solid, slightly raised look &mdash; best for lettering
+            and bold shapes.
+          </p>
+        </div>
+
+        <div class="field size-field">
+          <label for="width">How wide should it be when stitched?</label>
+          <p class="help">The height adjusts on its own to keep the shape.</p>
+          <div class="inline">
+            <input type="number" id="width" min="10" step="1" value="120" />
+            <select id="unit">
+              <option value="mm">mm</option>
+              <option value="in">inches</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="hoop">Hoop size</label>
+          <p class="help">
+            The hoop is the frame that clamps your fabric in the machine. Each
+            one has a maximum stitch area &mdash; set by your machine and the
+            hoop you own, and listed in the machine&rsquo;s manual (often printed
+            on the hoop itself, as width&nbsp;&times;&nbsp;height like 4&times;4&Prime;).
+            We&rsquo;ll warn you if the design won&rsquo;t fit the one you pick.
+          </p>
+          <select id="hoop">
+            <option value="">Skip this check</option>
+            <option value="100x100">4&times;4&Prime; (100&times;100&nbsp;mm)</option>
+            <option value="130x180">5&times;7&Prime; (130&times;180&nbsp;mm)</option>
+            <option value="160x260">6&times;10&Prime; (160&times;260&nbsp;mm)</option>
+            <option value="200x200">8&times;8&Prime; (200&times;200&nbsp;mm)</option>
+            <option value="360x200">14&times;8&Prime; (360&times;200&nbsp;mm)</option>
+          </select>
+        </div>
+
+        <details class="advanced" id="advanced">
+          <summary>More options</summary>
+          <p class="help">
+            The defaults work for most line drawings &mdash; only change these if
+            you know you need to.
+          </p>
+          <div class="advanced-grid">
+            <div class="field">
+              <label for="stitch-len">Stitch length (mm)</label>
+              <p class="help">
+                Gap between needle points. Smaller is smoother but uses more
+                stitches.
+              </p>
+              <input type="number" id="stitch-len" min="0.8" max="5" step="0.1" value="2.0" />
+            </div>
+            <div class="field">
+              <label for="satin-step">Fill spacing (mm)</label>
+              <p class="help">
+                For a filled line: gap between the side-to-side stitches. Smaller
+                is denser.
+              </p>
+              <input type="number" id="satin-step" min="0.2" max="1" step="0.05" value="0.4" />
+            </div>
+            <div class="field">
+              <label for="max-colors">Most thread colors to use</label>
+              <p class="help">The largest number of colors to pull from the image.</p>
+              <input type="number" id="max-colors" min="1" max="8" step="1" value="4" />
+            </div>
+            <div class="field">
+              <label for="min-spur">Smallest detail to keep</label>
+              <p class="help">
+                Specks and stray bits smaller than this are treated as noise and
+                removed. Lower keeps more.
+              </p>
+              <input type="number" id="min-spur" min="2" max="40" step="1" value="15" />
+            </div>
+            <label class="checkbox">
+              <input type="checkbox" id="lock" checked />
+              Add anchor stitches
+              <span class="help">
+                Tiny stitches that lock the thread at the start and end of each
+                section so it doesn&rsquo;t come loose.
+              </span>
+            </label>
+          </div>
+        </details>
+
+        <fieldset class="field formats">
+          <legend>Which file type do you need?</legend>
+          <p class="help">
+            Pick whatever your machine reads. DST works with almost any machine.
+          </p>
+          <div class="format-grid" id="formats">
+            <label><input type="checkbox" value="vp3" checked /> VP3 <span>Husqvarna / Pfaff</span></label>
+            <label><input type="checkbox" value="dst" checked /> DST <span>Tajima &mdash; works almost anywhere</span></label>
+            <label><input type="checkbox" value="pes" /> PES <span>Brother / Babylock</span></label>
+            <label><input type="checkbox" value="jef" /> JEF <span>Janome</span></label>
+            <label><input type="checkbox" value="exp" /> EXP <span>Melco / Bernina</span></label>
+            <label><input type="checkbox" value="hus" /> HUS <span>Husqvarna (older)</span></label>
+            <label><input type="checkbox" value="pec" /> PEC <span>Brother (older)</span></label>
+          </div>
+        </fieldset>
+
+        <p class="error-banner" id="error" role="alert" hidden></p>
+        <button id="go" type="button" disabled>Convert</button>
+      </section>
+
+      <section class="panel results" id="results" hidden>
+        <div class="result-head">
+          <h2>Result</h2>
+          <p class="warn-stitch">
+            This is an automatic conversion, not hand digitizing. Always stitch a
+            test on scrap fabric first.
+          </p>
+        </div>
+
+        <p class="hoop-warn" id="hoop-warn" hidden></p>
+
+        <div class="result-body">
+          <div class="preview" id="preview-figure">
+            <div class="preview-bar">
+              <span id="preview-caption">The stitch paths that go into the file</span>
+              <button type="button" id="bg-toggle" class="bg-toggle" aria-pressed="false">
+                Dark background
+              </button>
+            </div>
+            <div id="preview" role="img" aria-label="Stitch preview"></div>
+          </div>
+
+          <div class="result-side">
+            <dl class="stats" id="stats"></dl>
+            <div class="downloads" id="downloads"></div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <p>
+          Works best on thin line drawings with a few flat colors. Solid shapes,
+          shading and photos need dedicated digitizing software such as Ink/Stitch
+          or SewArt.
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

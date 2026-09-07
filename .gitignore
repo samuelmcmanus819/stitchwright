@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# CLI output
+*.vp3
+*.dst
+*.pes
+*.jef
+*.exp
+*.hus
+*.pec
+*_preview.png
+
+# Node / web build (see web/.gitignore too)
+node_modules/
+dist/

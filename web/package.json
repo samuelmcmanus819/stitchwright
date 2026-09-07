@@ -1,0 +1,15 @@
+{
+  "name": "stitchwright-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "In-browser line-art to embroidery-file converter (runs png_to_embroidery.py under Pyodide).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.2.2"
+  }
+}
