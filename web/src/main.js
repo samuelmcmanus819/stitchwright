@@ -63,11 +63,53 @@ const els = {
   bgToggle: $('bg-toggle'),
   stats: $('stats'),
   downloads: $('downloads'),
+  tabEmbroidery: $('tab-embroidery'),
+  tabTiler: $('tab-tiler'),
+  modeEmbroidery: $('mode-embroidery'),
+  modeTiler: $('mode-tiler'),
+  tilerDrop: $('tiler-drop'),
+  tilerFile: $('tiler-file'),
+  tilerList: $('tiler-list'),
+  tilerPreset: $('tiler-preset'),
+  tilerCustomFields: $('tiler-custom-fields'),
+  tilerWidth: $('tiler-width'),
+  tilerHeight: $('tiler-height'),
+  tilerDpi: $('tiler-dpi'),
+  tilerBleed: $('tiler-bleed'),
+  tilerLayoutHelp: $('tiler-layout-help'),
+  tilerArrangementField: $('tiler-arrangement-field'),
+  tilerArrangement: $('tiler-arrangement'),
+  tilerSize: $('tiler-size'),
+  tilerSizeOut: $('tiler-size-out'),
+  tilerDensity: $('tiler-density'),
+  tilerDensityOut: $('tiler-density-out'),
+  tilerDensityHelp: $('tiler-density-help'),
+  tilerMargin: $('tiler-margin'),
+  tilerSpacingField: $('tiler-spacing-field'),
+  tilerSpacingHelp: $('tiler-spacing-help'),
+  tilerSpacing: $('tiler-spacing'),
+  tilerJitterField: $('tiler-jitter-field'),
+  tilerJitterHelp: $('tiler-jitter-help'),
+  tilerJitter: $('tiler-jitter'),
+  tilerRotationField: $('tiler-rotation-field'),
+  tilerRotationHelp: $('tiler-rotation-help'),
+  tilerRotation: $('tiler-rotation'),
+  tilerError: $('tiler-error'),
+  tilerGo: $('tiler-go'),
+  tilerShuffle: $('tiler-shuffle'),
+  tilerResults: $('tiler-results'),
+  tilerPreviewFigure: $('tiler-preview-figure'),
+  tilerPreview: $('tiler-preview'),
+  tilerStats: $('tiler-stats'),
+  tilerDownloads: $('tiler-downloads'),
 }
 
 let engineReady = false
 let selectedFile = null
+let activeMode = 'embroidery' // routes worker responses to the right panel
 const objectUrls = new Set()
+const tilerFiles = [] // { file, url, name, scale, lockRotation }
+let tilerSeed = 0 // bumped by the Shuffle button; stable across a plain Generate
 
 // ---------------------------------------------------------------------------
 // Worker
@@ -90,17 +132,28 @@ worker.onmessage = (event) => {
       els.status.textContent = 'Ready to convert.'
       els.engineHint.textContent = 'Ready and saved on your device. Choose an image below.'
       refreshGoButton()
+      refreshTilerGoButton()
       break
     case 'result':
       renderResult(msg)
       els.status.textContent = `Done — ${msg.stats.stitch_count.toLocaleString()} stitches.`
       setBusy(false)
       break
+    case 'tileResult':
+      renderTilerResult(msg)
+      els.status.textContent = `Done — ${msg.stats.placed_count.toLocaleString()} design(s) placed.`
+      setTilerBusy(false)
+      break
     case 'error':
       els.status.textContent = 'Error'
       appendLog(`ERROR: ${msg.message}`)
-      showError(msg.message)
-      setBusy(false)
+      if (activeMode === 'tiler') {
+        showTilerError(msg.message)
+        setTilerBusy(false)
+      } else {
+        showError(msg.message)
+        setBusy(false)
+      }
       break
   }
 }
@@ -110,6 +163,24 @@ function appendLog(line) {
   els.log.textContent += line + '\n'
   els.log.scrollTop = els.log.scrollHeight
 }
+
+// ---------------------------------------------------------------------------
+// Mode tabs
+// ---------------------------------------------------------------------------
+
+function setMode(mode) {
+  activeMode = mode
+  const embroidery = mode === 'embroidery'
+  els.modeEmbroidery.hidden = !embroidery
+  els.modeTiler.hidden = embroidery
+  els.tabEmbroidery.classList.toggle('active', embroidery)
+  els.tabTiler.classList.toggle('active', !embroidery)
+  els.tabEmbroidery.setAttribute('aria-selected', String(embroidery))
+  els.tabTiler.setAttribute('aria-selected', String(!embroidery))
+}
+
+els.tabEmbroidery.addEventListener('click', () => setMode('embroidery'))
+els.tabTiler.addEventListener('click', () => setMode('tiler'))
 
 // ---------------------------------------------------------------------------
 // File selection
@@ -210,6 +281,7 @@ function widthMm() {
 }
 
 async function runConvert() {
+  activeMode = 'embroidery' // in case a tiler job is also in flight when this resolves
   const width_mm = widthMm()
   if (width_mm === null) {
     showError('Enter a finished width greater than zero.')
@@ -372,6 +444,286 @@ function checkHoop(stats) {
 }
 
 // ---------------------------------------------------------------------------
+// Pattern Tiler
+// ---------------------------------------------------------------------------
+
+const tilerThumbUrls = new Set()
+let tilerResultUrls = []
+
+els.tilerFile.addEventListener('change', () => {
+  if (els.tilerFile.files && els.tilerFile.files.length) addTilerFiles(els.tilerFile.files)
+  els.tilerFile.value = '' // allow re-adding a removed file
+})
+
+els.tilerDrop.addEventListener('dragover', (e) => {
+  e.preventDefault()
+  els.tilerDrop.classList.add('over')
+})
+els.tilerDrop.addEventListener('dragleave', () => els.tilerDrop.classList.remove('over'))
+els.tilerDrop.addEventListener('drop', (e) => {
+  e.preventDefault()
+  els.tilerDrop.classList.remove('over')
+  if (e.dataTransfer.files && e.dataTransfer.files.length) addTilerFiles(e.dataTransfer.files)
+})
+els.tilerDrop.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault()
+    els.tilerFile.click()
+  }
+})
+
+function addTilerFiles(fileList) {
+  clearTilerError()
+  for (const file of fileList) {
+    if (!file.type.startsWith('image/') && !isSvg(file)) continue // silently skip a stray non-image
+    const url = URL.createObjectURL(file) // browsers render SVG blobs in <img> directly, so thumbnails need no rasterization
+    tilerThumbUrls.add(url)
+    tilerFiles.push({ file, url, name: file.name, scale: 1, lockRotation: false })
+  }
+  renderTilerList()
+  refreshTilerGoButton()
+}
+
+function renderTilerList() {
+  els.tilerList.innerHTML = ''
+  tilerFiles.forEach((item, i) => {
+    const el = document.createElement('div')
+    el.className = 'tile-item'
+    el.innerHTML = `
+      <img src="${item.url}" alt="${escapeHtml(item.name)}" />
+      <span class="tile-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
+      <div class="tile-controls">
+        <input type="number" class="tile-scale" min="0.3" max="1.5" step="0.1" value="${item.scale}"
+          title="Relative scale within its cell" />
+        <label class="tile-lock" title="Keep this design from rotating">
+          <input type="checkbox" ${item.lockRotation ? 'checked' : ''} /> &#128274;
+        </label>
+      </div>
+      <button type="button">Remove</button>
+    `
+    el.querySelector('.tile-scale').addEventListener('change', (e) => {
+      item.scale = clampNum(e.target.value, 0.3, 1.5, 1)
+      e.target.value = item.scale
+    })
+    const lockLabel = el.querySelector('.tile-lock')
+    lockLabel.querySelector('input').addEventListener('change', (e) => {
+      item.lockRotation = e.target.checked
+      lockLabel.classList.toggle('on', item.lockRotation)
+    })
+    el.querySelector('button').addEventListener('click', () => {
+      URL.revokeObjectURL(item.url)
+      tilerThumbUrls.delete(item.url)
+      tilerFiles.splice(i, 1)
+      renderTilerList()
+      refreshTilerGoButton()
+    })
+    els.tilerList.appendChild(el)
+  })
+}
+
+els.tilerPreset.addEventListener('change', () => {
+  els.tilerCustomFields.hidden = els.tilerPreset.value !== 'custom'
+})
+
+// "Spacing style" presets (Grid repeat only): quick-set the underlying
+// spacing/drift/tilt knobs. Still plain number inputs underneath, so a user
+// can nudge any of them afterward under "More options" without losing the
+// rest of the preset.
+const ARRANGEMENTS = {
+  even: { spacing_in: 0.125, jitter: 0, rotation: 0 },
+  loose: { spacing_in: 0.375, jitter: 0, rotation: 0 },
+  scattered: { spacing_in: 0.1875, jitter: 85, rotation: 15 },
+}
+
+function applyArrangement() {
+  const a = ARRANGEMENTS[els.tilerArrangement.value] || ARRANGEMENTS.even
+  els.tilerSpacing.value = a.spacing_in
+  els.tilerJitter.value = a.jitter
+  els.tilerRotation.value = a.rotation
+}
+
+els.tilerArrangement.addEventListener('change', applyArrangement)
+
+// Layout mode changes what several controls mean, so copy and defaults are
+// swapped in per mode rather than reusing one static set of labels.
+const LAYOUT_HELP = {
+  grid: '<strong>Grid repeat</strong> cycles your designs round-robin through a fixed grid of cells that fills the whole canvas — good for sticker sheets and alternating patterns.',
+  scatter: '<strong>Scatter/random</strong> places designs at random positions, sizes and rotations, retrying each one to guarantee nothing overlaps — good for florals and organic sticker sheets.',
+  seamless: '<strong>Seamless tile</strong> arranges your designs once into a small repeat unit, then tiles it edge-to-edge with no visible seam — good for continuous fabric-style patterns.',
+}
+const DENSITY_HELP = {
+  grid: 'How many designs fit across the canvas. Rows fill in automatically.',
+  scatter: 'Roughly how many designs to scatter across the canvas.',
+  seamless: 'How many times the repeat unit tiles across the canvas width.',
+}
+
+function tilerLayoutMode() {
+  const checked = document.querySelector('input[name="tiler-layout"]:checked')
+  return checked ? checked.value : 'grid'
+}
+
+function updateLayoutModeUI() {
+  const mode = tilerLayoutMode()
+  els.tilerLayoutHelp.innerHTML = LAYOUT_HELP[mode]
+  els.tilerDensityHelp.textContent = DENSITY_HELP[mode]
+
+  els.tilerArrangementField.hidden = mode !== 'grid'
+  els.tilerSpacingField.hidden = mode === 'seamless'
+  els.tilerJitterField.hidden = mode === 'seamless'
+  els.tilerRotationField.hidden = mode === 'seamless'
+
+  if (mode === 'grid') {
+    applyArrangement() // restore whatever "Spacing style" is currently selected
+    els.tilerJitterHelp.textContent = 'How far off-center a design may land. Set by the spacing style above.'
+    els.tilerRotationHelp.textContent = 'Maximum random rotation per design. Set by the spacing style above.'
+  } else if (mode === 'scatter') {
+    els.tilerJitter.value = 50
+    els.tilerRotation.value = 180
+    els.tilerJitterHelp.textContent = 'How much design sizes vary from one to the next.'
+    els.tilerRotationHelp.textContent = 'Maximum random rotation per design.'
+  }
+}
+
+document.querySelectorAll('input[name="tiler-layout"]').forEach((el) => {
+  el.addEventListener('change', updateLayoutModeUI)
+})
+updateLayoutModeUI()
+
+els.tilerSize.addEventListener('input', () => {
+  els.tilerSizeOut.textContent = `${els.tilerSize.value}%`
+})
+
+els.tilerDensity.addEventListener('input', () => {
+  els.tilerDensityOut.textContent = `${els.tilerDensity.value} across`
+})
+
+function refreshTilerGoButton() {
+  const disabled = !(engineReady && tilerFiles.length > 0) || els.tilerGo.dataset.busy === '1'
+  els.tilerGo.disabled = disabled
+  els.tilerShuffle.disabled = disabled
+}
+
+els.tilerGo.addEventListener('click', () => runTiler())
+els.tilerShuffle.addEventListener('click', () => {
+  tilerSeed = Math.floor(Math.random() * 1_000_000)
+  runTiler()
+})
+
+async function runTiler() {
+  if (!tilerFiles.length) return
+  activeMode = 'tiler' // in case an embroidery job is also in flight when this resolves
+  clearTilerError()
+  setTilerBusy(true)
+  els.log.textContent = ''
+
+  const options = {
+    layout_mode: tilerLayoutMode(),
+    columns: clampInt(els.tilerDensity.value, 2, 10, 4),
+    margin_in: clampNum(els.tilerMargin.value, 0, 3, 0.125),
+    spacing_in: clampNum(els.tilerSpacing.value, 0, 3, 0.125),
+    design_scale: clampNum(els.tilerSize.value, 40, 100, 100) / 100,
+    jitter: clampNum(els.tilerJitter.value, 0, 100, 0) / 100,
+    rotation_jitter_deg: clampNum(els.tilerRotation.value, 0, 180, 0),
+    seed: tilerSeed,
+    make_preview: true,
+  }
+  if (els.tilerPreset.value === 'custom') {
+    options.width_in = clampNum(els.tilerWidth.value, 0.5, 200, 8.5)
+    options.height_in = clampNum(els.tilerHeight.value, 0.5, 200, 11)
+    options.dpi = clampInt(els.tilerDpi.value, 72, 600, 300)
+    options.bleed_in = clampNum(els.tilerBleed.value, 0, 3, 0.125)
+  } else {
+    options.preset = els.tilerPreset.value
+  }
+
+  let images
+  try {
+    images = await Promise.all(
+      tilerFiles.map(async (item) => ({
+        name: item.name,
+        scale: item.scale,
+        lockRotation: item.lockRotation,
+        bytes: isSvg(item.file) ? await rasterizeSvg(item.file) : await item.file.arrayBuffer(),
+      })),
+    )
+  } catch (err) {
+    showTilerError(`Could not read a design image: ${err.message || err}`)
+    setTilerBusy(false)
+    return
+  }
+
+  worker.postMessage(
+    { type: 'tile', payload: { images, options } },
+    images.map((img) => img.bytes),
+  )
+}
+
+function setTilerBusy(busy) {
+  els.tilerGo.dataset.busy = busy ? '1' : '0'
+  const disabled = busy || !engineReady || tilerFiles.length === 0
+  els.tilerGo.disabled = disabled
+  els.tilerShuffle.disabled = disabled
+  els.tilerGo.textContent = busy ? 'Working…' : 'Generate layout'
+  if (busy) els.tilerResults.hidden = true
+}
+
+function renderTilerResult({ imagePng, previewPng, stats }) {
+  for (const url of tilerResultUrls) URL.revokeObjectURL(url)
+  tilerResultUrls = []
+
+  const makeResultUrl = (blob) => {
+    const url = URL.createObjectURL(blob)
+    tilerResultUrls.push(url)
+    return url
+  }
+
+  const previewUrl = makeResultUrl(new Blob([previewPng || imagePng], { type: 'image/png' }))
+  els.tilerPreview.innerHTML = `<img src="${previewUrl}" alt="Pattern layout preview" />`
+
+  const gridRow = stats.columns
+    ? row('Grid', `${stats.columns} &times; ${stats.rows}`)
+    : ''
+  els.tilerStats.innerHTML =
+    row(
+      'Canvas size',
+      `${stats.canvas_width_in} &times; ${stats.canvas_height_in} in ` +
+        `<span class="muted">(${stats.canvas_width_px}&times;${stats.canvas_height_px}px @ ${stats.dpi} DPI)</span>`,
+    ) +
+    row('Bleed', `${stats.bleed_in} in`) +
+    row('Layout', stats.layout_mode) +
+    row('Designs used', stats.image_count) +
+    row('Placed', stats.placed_count) +
+    gridRow +
+    row('Design size', `${Math.round(stats.design_scale * 100)}%`) +
+    (stats.layout_mode !== 'seamless' && stats.jitter > 0
+      ? row('Drift / tilt', `${Math.round(stats.jitter * 100)}% / ±${stats.rotation_jitter_deg}°`)
+      : '')
+
+  const fullUrl = makeResultUrl(new Blob([imagePng], { type: 'image/png' }))
+  els.tilerDownloads.innerHTML = ''
+  const a = document.createElement('a')
+  a.href = fullUrl
+  a.download = 'pattern.png'
+  a.className = 'download'
+  a.innerHTML = `<span>PNG</span><small>${formatKb(imagePng.length)} &middot; full resolution</small>`
+  els.tilerDownloads.appendChild(a)
+
+  els.tilerResults.hidden = false
+  els.tilerResults.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function showTilerError(message) {
+  els.tilerError.hidden = false
+  els.tilerError.textContent = message
+  els.tilerError.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+function clearTilerError() {
+  els.tilerError.hidden = true
+  els.tilerError.textContent = ''
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -423,4 +775,6 @@ function escapeHtml(s) {
 
 window.addEventListener('beforeunload', () => {
   for (const url of objectUrls) URL.revokeObjectURL(url)
+  for (const url of tilerThumbUrls) URL.revokeObjectURL(url)
+  for (const url of tilerResultUrls) URL.revokeObjectURL(url)
 })

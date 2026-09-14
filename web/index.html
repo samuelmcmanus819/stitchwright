@@ -37,6 +37,16 @@
         </details>
       </section>
 
+      <div class="tabs" id="mode-tabs" role="tablist">
+        <button type="button" class="tab active" id="tab-embroidery" role="tab" aria-selected="true">
+          Embroidery
+        </button>
+        <button type="button" class="tab" id="tab-tiler" role="tab" aria-selected="false">
+          Pattern Tiler
+        </button>
+      </div>
+
+      <div id="mode-embroidery" class="mode-panel">
       <section class="panel">
         <label
           class="dropzone"
@@ -201,12 +211,170 @@
           </div>
         </div>
       </section>
+      </div>
+
+      <div id="mode-tiler" class="mode-panel" hidden>
+      <section class="panel">
+        <label
+          class="dropzone"
+          id="tiler-drop"
+          for="tiler-file"
+          tabindex="0"
+          aria-label="Choose or drop one or more design images"
+        >
+          <input
+            type="file"
+            id="tiler-file"
+            accept="image/png,image/jpeg,image/webp,image/svg+xml,.svg"
+            multiple
+            hidden
+          />
+          <span id="tiler-drop-label">
+            <strong>Drop one or more design images here</strong>
+            <span>or click to choose &mdash; PNG, JPG, WebP or SVG</span>
+          </span>
+        </label>
+        <div class="tile-list" id="tiler-list"></div>
+      </section>
+
+      <section class="panel controls">
+        <div class="field">
+          <label for="tiler-preset">Product</label>
+          <select id="tiler-preset">
+            <option value="sticker_sheet">Sticker sheet (8.5&times;11&Prime;)</option>
+            <option value="mug_wrap">Mug wrap (9&times;3.5&Prime;)</option>
+            <option value="tote_bag">Tote bag (15&times;16&Prime;)</option>
+            <option value="phone_case">Phone case (3&times;6&Prime;)</option>
+            <option value="tshirt_front">T-shirt front (12&times;16&Prime;)</option>
+            <option value="fabric_yard">Fabric yard (continuous repeat)</option>
+            <option value="custom">Custom size&hellip;</option>
+          </select>
+          <p class="help">Sets the finished canvas size, print DPI and bleed. Any of these can be overridden below.</p>
+        </div>
+
+        <div class="field" id="tiler-custom-fields" hidden>
+          <label>Custom canvas</label>
+          <div class="advanced-grid">
+            <div class="field">
+              <label for="tiler-width">Width (in)</label>
+              <input type="number" id="tiler-width" min="0.5" step="0.25" value="8.5" />
+            </div>
+            <div class="field">
+              <label for="tiler-height">Height (in)</label>
+              <input type="number" id="tiler-height" min="0.5" step="0.25" value="11" />
+            </div>
+            <div class="field">
+              <label for="tiler-dpi">DPI</label>
+              <input type="number" id="tiler-dpi" min="72" max="600" step="1" value="300" />
+            </div>
+            <div class="field">
+              <label for="tiler-bleed">Bleed (in)</label>
+              <input type="number" id="tiler-bleed" min="0" step="0.0625" value="0.125" />
+            </div>
+          </div>
+        </div>
+
+        <fieldset class="field">
+          <legend>Layout</legend>
+          <div class="format-grid">
+            <label><input type="radio" name="tiler-layout" value="grid" checked /> Grid repeat</label>
+            <label><input type="radio" name="tiler-layout" value="scatter" /> Scatter/random</label>
+            <label><input type="radio" name="tiler-layout" value="seamless" /> Seamless tile</label>
+          </div>
+          <p class="help" id="tiler-layout-help">
+            <strong>Grid repeat</strong> cycles your designs round-robin through a
+            fixed grid of cells that fills the whole canvas &mdash; good for
+            sticker sheets and alternating patterns.
+          </p>
+        </fieldset>
+
+        <div class="field" id="tiler-arrangement-field">
+          <label for="tiler-arrangement">Spacing style</label>
+          <select id="tiler-arrangement">
+            <option value="even">Even grid</option>
+            <option value="loose">Loose grid</option>
+            <option value="scattered">Scattered</option>
+          </select>
+          <p class="help">
+            Sets how the designs sit within the grid: perfectly even, spaced
+            further apart, or drifting off-center with a slight random tilt for
+            an organic sticker-sheet look. Fine-tune any of this under
+            &ldquo;More options&rdquo; below.
+          </p>
+        </div>
+
+        <div class="field slider-field">
+          <label for="tiler-size">Design size <output id="tiler-size-out" for="tiler-size">100%</output></label>
+          <p class="help">How much of its grid cell each design fills. Lower leaves more air around it.</p>
+          <input type="range" id="tiler-size" min="40" max="100" step="5" value="100" />
+        </div>
+
+        <div class="field slider-field">
+          <label for="tiler-density">Density <output id="tiler-density-out" for="tiler-density">4 across</output></label>
+          <p class="help" id="tiler-density-help">How many designs fit across the canvas. Rows fill in automatically.</p>
+          <input type="range" id="tiler-density" min="2" max="10" step="1" value="4" />
+        </div>
+
+        <details class="advanced" id="tiler-advanced">
+          <summary>More options</summary>
+          <div class="advanced-grid">
+            <div class="field">
+              <label for="tiler-margin">Margin (in)</label>
+              <input type="number" id="tiler-margin" min="0" step="0.0625" value="0.125" />
+            </div>
+            <div class="field" id="tiler-spacing-field">
+              <label for="tiler-spacing">Spacing between designs (in)</label>
+              <p class="help" id="tiler-spacing-help">Minimum gap between designs.</p>
+              <input type="number" id="tiler-spacing" min="0" step="0.0625" value="0.125" />
+            </div>
+            <div class="field" id="tiler-jitter-field">
+              <label for="tiler-jitter">Drift (%)</label>
+              <p class="help" id="tiler-jitter-help">How far off-center a design may land. Set by the spacing style above.</p>
+              <input type="number" id="tiler-jitter" min="0" max="100" step="5" value="0" />
+            </div>
+            <div class="field" id="tiler-rotation-field">
+              <label for="tiler-rotation">Random tilt (&deg;)</label>
+              <p class="help" id="tiler-rotation-help">Maximum random rotation per design. Set by the spacing style above.</p>
+              <input type="number" id="tiler-rotation" min="0" max="180" step="1" value="0" />
+            </div>
+          </div>
+        </details>
+
+        <p class="error-banner" id="tiler-error" role="alert" hidden></p>
+        <div class="btn-row">
+          <button id="tiler-go" type="button" disabled>Generate layout</button>
+          <button id="tiler-shuffle" class="btn-secondary" type="button" disabled title="Regenerate with a new random arrangement">
+            &#127922; Shuffle
+          </button>
+        </div>
+      </section>
+
+      <section class="panel results" id="tiler-results" hidden>
+        <div class="result-head">
+          <h2>Result</h2>
+        </div>
+
+        <div class="result-body">
+          <div class="preview" id="tiler-preview-figure">
+            <div class="preview-bar">
+              <span id="tiler-preview-caption">Preview</span>
+            </div>
+            <div id="tiler-preview" role="img" aria-label="Pattern layout preview"></div>
+          </div>
+
+          <div class="result-side">
+            <dl class="stats" id="tiler-stats"></dl>
+            <div class="downloads" id="tiler-downloads"></div>
+          </div>
+        </div>
+      </section>
+      </div>
 
       <footer class="foot">
         <p>
-          Works best on thin line drawings with a few flat colors. Solid shapes,
-          shading and photos need dedicated digitizing software such as Ink/Stitch
-          or SewArt.
+          Embroidery works best on thin line drawings with a few flat colors.
+          Solid shapes, shading and photos need dedicated digitizing software
+          such as Ink/Stitch or SewArt.
         </p>
       </footer>
     </main>

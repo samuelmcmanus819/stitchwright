@@ -89,6 +89,9 @@ from collections import defaultdict
 import numpy as np
 from PIL import Image
 
+from core.errors import StitchwrightError
+from core.imaging import rewind
+
 # Output formats we can emit. Each value is the pyembroidery writer function
 # name; they are imported lazily so that importing this module (e.g. under
 # Pyodide, before micropip has installed pyembroidery) stays cheap.
@@ -569,7 +572,7 @@ def build_pattern(color_runs, scale_mm_per_px, lock_stitches=True):
 # filesystem itself, so it works unchanged in a browser under Pyodide.
 # ---------------------------------------------------------------------------
 
-class ConversionError(Exception):
+class ConversionError(StitchwrightError):
     """A problem worth showing the user verbatim: unreadable image, no
     stitchable line art, or an unsupported output format."""
 
@@ -658,11 +661,7 @@ def convert(
     if width_mm <= 0:
         raise ConversionError("width_mm must be positive.")
 
-    if hasattr(image_source, "seek"):
-        try:
-            image_source.seek(0)
-        except Exception:
-            pass
+    rewind(image_source)
 
     try:
         masks, (img_h, img_w) = extract_color_masks(image_source, max_colors=max_colors)
