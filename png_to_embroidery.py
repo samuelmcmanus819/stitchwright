@@ -107,6 +107,35 @@ SUPPORTED_FORMATS = {
 
 DEFAULT_FORMATS = ("vp3", "dst")
 
+# Safety cap on total input-image pixels. skeleton_to_graph() puts one
+# networkx node per skeleton pixel and extract_color_masks() k-means-clusters
+# every ink pixel; both scale badly on large/complex images with no natural
+# ceiling otherwise. ~16 megapixels comfortably covers real line-art/logo
+# source images (this tool's intended input) with headroom.
+MAX_IMAGE_PIXELS = 16_000_000
+
+# max_colors controls k-means cluster count; min_spur_len feeds pruning-loop
+# iteration counts. Both are unbounded from the CLI/library API (only the web
+# UI clamps them client-side), so cap them here too.
+MAX_ALLOWED_COLORS = 12
+MAX_ALLOWED_SPUR_LEN = 500
+
+# route_fragments_eulerian() calls networkx.eulerize() per connected skeleton
+# component, which is roughly O(k^2 * (V+E) + k^3) in the number of
+# odd-degree ("junction") nodes k (all-pairs shortest paths + max-weight
+# matching over them). A busy/high-detail image can produce components with
+# hundreds of junctions, which can hang or exhaust memory. Above this many
+# odd-degree nodes, skip eulerization for that component and emit each
+# fragment as its own stitch run instead (more trims, but bounded cost).
+EULERIZE_ODD_NODE_CAP = 60
+
+# order_runs_greedy() now orders runs in O(n log n) (k-d tree), so this is a
+# generous sanity ceiling rather than the primary defense — it exists so a
+# truly pathological (e.g. photographic) image fails fast with a clear
+# message instead of consuming unbounded memory building fragments/graphs
+# for a color that was never going to be stitchable line art anyway.
+MAX_FRAGMENTS_PER_COLOR = 20_000
+
 
 def log(msg):
     print(f"[png_to_embroidery] {msg}", file=sys.stderr)
@@ -121,7 +150,13 @@ def extract_color_masks(image_source, max_colors=4, bg_white_thresh=245, min_pix
     (e.g. io.BytesIO wrapping uploaded bytes)."""
     from scipy.cluster.vq import kmeans2
 
-    img = Image.open(image_source).convert("RGBA")
+    img = Image.open(image_source)
+    if img.width * img.height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is {img.width}x{img.height} ({img.width * img.height:,} px) — too large "
+            f"to process safely (limit {MAX_IMAGE_PIXELS:,} px). Downscale the image first."
+        )
+    img = img.convert("RGBA")
     arr = np.array(img)
     alpha = arr[:, :, 3].astype(float) / 255.0
     rgb = arr[:, :, :3].astype(float)
@@ -236,20 +271,42 @@ def prune_spurs(G, min_len=15):
 
 
 def merge_close_junctions(G):
-    import networkx as nx
+    """Contract every edge whose both endpoints are junctions (degree >= 3)
+    into a single node, repeating since a contraction can create new
+    degree-3+ pairs. Uses an incremental candidate queue and mutates one
+    graph in place, rather than rescanning every edge and deep-copying the
+    whole graph per merge — on a busy/high-detail skeleton (many junctions)
+    that full-rescan-per-merge approach is roughly O(junctions * edges) and
+    can take tens of seconds to minutes; this is amortized O(V + E)."""
+    from collections import deque
+
     G = G.copy()
-    while True:
-        degrees = dict(G.degree())
-        edge_to_merge = None
-        for u, v in G.edges():
-            if degrees.get(u, 0) >= 3 and degrees.get(v, 0) >= 3:
-                edge_to_merge = (u, v)
-                break
-        if edge_to_merge is None:
-            break
-        u, v = edge_to_merge
-        G = nx.contracted_nodes(G, u, v, self_loops=False)
-        G = nx.Graph(G)
+    queued = set()
+    queue = deque()
+
+    def maybe_queue(u, v):
+        if G.degree(u) >= 3 and G.degree(v) >= 3:
+            key = (u, v) if u <= v else (v, u)
+            if key not in queued:
+                queued.add(key)
+                queue.append(key)
+
+    for u, v in G.edges():
+        maybe_queue(u, v)
+
+    while queue:
+        u, v = queue.popleft()
+        queued.discard((u, v))
+        if u not in G or v not in G or not G.has_edge(u, v):
+            continue
+        if G.degree(u) < 3 or G.degree(v) < 3:
+            continue
+        for n in list(G.neighbors(v)):
+            if n != u and not G.has_edge(u, n):
+                G.add_edge(u, n)
+        G.remove_node(v)
+        for n in G.neighbors(u):
+            maybe_queue(u, n)
     return G
 
 
@@ -350,6 +407,25 @@ def route_fragments_eulerian(fragments):
         sub = MG.subgraph(comp_nodes).copy()
         if sub.number_of_edges() == 0:
             continue
+
+        odd_nodes = [n for n, d in sub.degree() if d % 2 == 1]
+        if not nx.is_eulerian(sub) and len(odd_nodes) > EULERIZE_ODD_NODE_CAP:
+            # Too many junctions to eulerize safely (see EULERIZE_ODD_NODE_CAP) —
+            # fall back to one run per fragment instead of a single routed
+            # circuit. More trims, but bounded cost on busy/complex art.
+            log(
+                f"  component has {len(odd_nodes)} junctions (>{EULERIZE_ODD_NODE_CAP}); "
+                "skipping eulerization, routing fragments separately"
+            )
+            for u, v, k, data in sub.edges(keys=True, data=True):
+                idx = data.get("idx")
+                if idx is None:
+                    continue
+                frag = fragments[idx]
+                if len(frag) >= 2:
+                    routed.append(frag)
+            continue
+
         sub_e = sub if nx.is_eulerian(sub) else nx.eulerize(sub)
         circuit = list(nx.eulerian_circuit(sub_e, keys=True, source=list(sub_e.nodes())[0]))
 
@@ -471,6 +547,12 @@ def process_color_mask(mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_
     G = merge_close_junctions(G)
     G = prune_spurs(G, min_len=min_spur_len)
     fragments = extract_fragments(G)
+    if len(fragments) > MAX_FRAGMENTS_PER_COLOR:
+        raise ValueError(
+            f"artwork is too detailed for this tool ({len(fragments)} distinct strokes in one "
+            f"color, limit {MAX_FRAGMENTS_PER_COLOR}) — this converter targets thin line art, "
+            "not busy/noisy or photographic images; simplify or flatten the source image"
+        )
     routed = route_fragments_eulerian(fragments)
 
     runs = []
@@ -485,31 +567,52 @@ def process_color_mask(mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_
 
 
 def order_runs_greedy(runs):
-    remaining = list(range(len(runs)))
+    """Greedy nearest-neighbor ordering to reduce travel between runs.
+
+    Uses a k-d tree over all run endpoints with soft deletion (an expanding-k
+    query that skips already-used points) instead of a naive O(n^2) scan of
+    every remaining run at every step. That naive version is fine for a
+    handful of strokes but became the dominant cost on real multi-thousand-
+    stroke designs — e.g. ~9300 runs took ~4 minutes in it alone. This is
+    O(n log n) in the typical case."""
+    n = len(runs)
+    if n <= 1:
+        return runs
+
+    from scipy.spatial import cKDTree
+
+    starts = np.array([r[0][0] for r in runs])
+    ends = np.array([r[-1][-1] for r in runs])
+    pts = np.vstack([starts, ends])  # index i -> start of run i; index n+i -> end of run i
+    tree = cKDTree(pts)
+    removed = np.zeros(2 * n, dtype=bool)
+
     ordered, reversed_flags = [], []
     cur_pos = np.array([0.0, 0.0])
 
-    def run_start(r):
-        return r[0][0]
+    for _ in range(n):
+        k = 1
+        chosen = None
+        while chosen is None:
+            k = min(k, 2 * n)
+            _, idxs = tree.query(cur_pos, k=k)
+            idxs = np.atleast_1d(idxs)
+            for idx in idxs:
+                if not removed[idx]:
+                    chosen = int(idx)
+                    break
+            if chosen is None:
+                if k >= 2 * n:
+                    break
+                k *= 4
+        run_i = chosen % n
+        rev = chosen >= n
+        ordered.append(run_i)
+        reversed_flags.append(rev)
+        removed[run_i] = True
+        removed[run_i + n] = True
+        cur_pos = starts[run_i] if rev else ends[run_i]
 
-    def run_end(r):
-        return r[-1][-1]
-
-    while remaining:
-        best_i, best_d, best_rev = None, None, False
-        for i in remaining:
-            r = runs[i]
-            d0 = np.linalg.norm(run_start(r) - cur_pos)
-            d1 = np.linalg.norm(run_end(r) - cur_pos)
-            if best_d is None or d0 < best_d:
-                best_d, best_i, best_rev = d0, i, False
-            if d1 < best_d:
-                best_d, best_i, best_rev = d1, i, True
-        ordered.append(best_i)
-        reversed_flags.append(best_rev)
-        r = runs[best_i]
-        cur_pos = run_start(r) if best_rev else run_end(r)
-        remaining.remove(best_i)
     return [
         ([seg[::-1] for seg in reversed(runs[i])] if rev else runs[i])
         for i, rev in zip(ordered, reversed_flags)
@@ -660,30 +763,45 @@ def convert(
         raise ConversionError("stitch_type must be 'running' or 'satin'.")
     if width_mm <= 0:
         raise ConversionError("width_mm must be positive.")
+    if not (1 <= max_colors <= MAX_ALLOWED_COLORS):
+        raise ConversionError(f"max_colors must be between 1 and {MAX_ALLOWED_COLORS}.")
+    if not (0 <= min_spur_len <= MAX_ALLOWED_SPUR_LEN):
+        raise ConversionError(f"min_spur_len must be between 0 and {MAX_ALLOWED_SPUR_LEN}.")
 
     rewind(image_source)
 
     try:
         masks, (img_h, img_w) = extract_color_masks(image_source, max_colors=max_colors)
-    except (ValueError, UnidentifiedImageError, OSError) as exc:
+    except (ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise ConversionError(f"Could not process image: {exc}") from exc
 
     scale_mm_per_px = width_mm / img_w
 
     color_runs = []
     total_runs = 0
+    skipped = []
     for color, mask in masks:
         log(f"Processing color {color} ({int(mask.sum())} px)...")
-        runs = process_color_mask(
-            mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
-            min_spur_len=min_spur_len,
-        )
+        try:
+            runs = process_color_mask(
+                mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
+                min_spur_len=min_spur_len,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one bad color, not the whole image
+            log(f"  -> skipped color {color}: {exc}")
+            skipped.append((color, str(exc)))
+            color_runs.append((color, []))
+            continue
         runs = order_runs_greedy(runs)
         total_runs += len(runs)
         log(f"  -> {len(runs)} continuous stitch run(s)")
         color_runs.append((color, runs))
 
     if total_runs == 0:
+        if skipped:
+            raise ConversionError(
+                "Could not stitch this image: " + "; ".join(msg for _, msg in skipped)
+            )
         raise ConversionError(
             "No stitchable strokes found. This tool expects thin line art; "
             "filled or photographic images need real digitizing software."
