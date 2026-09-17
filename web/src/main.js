@@ -49,7 +49,12 @@ const els = {
   advanced: $('advanced'),
   stitchType: $('stitch-type'),
   stitchLen: $('stitch-len'),
+  stitchLenWarn: $('stitch-len-warn'),
   satinStep: $('satin-step'),
+  satinStepWarn: $('satin-step-warn'),
+  rowSpacing: $('row-spacing'),
+  rowSpacingWarn: $('row-spacing-warn'),
+  fillAngle: $('fill-angle'),
   maxColors: $('max-colors'),
   minSpur: $('min-spur'),
   lock: $('lock'),
@@ -259,6 +264,29 @@ els.bgToggle.addEventListener('click', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Danger-zone warnings on the density fields -- informational only, never
+// block Convert. Too-tight spacing risks punching through stabilizer,
+// snapping thread, or jamming the machine's hook.
+// ---------------------------------------------------------------------------
+
+function watchDangerZone(input, warnEl, minSafe, label) {
+  const update = () => {
+    const val = parseFloat(input.value)
+    const dangerous = isFinite(val) && val < minSafe
+    warnEl.hidden = !dangerous
+    if (dangerous) {
+      warnEl.textContent = `Below ${minSafe}mm is risky: ${label} this tight can punch through stabilizer, snap thread, or jam the machine.`
+    }
+  }
+  input.addEventListener('input', update)
+  update()
+}
+
+watchDangerZone(els.stitchLen, els.stitchLenWarn, 1.5, 'stitches')
+watchDangerZone(els.satinStep, els.satinStepWarn, 0.4, 'satin spacing')
+watchDangerZone(els.rowSpacing, els.rowSpacingWarn, 0.45, 'fill row spacing')
+
+// ---------------------------------------------------------------------------
 // Convert
 // ---------------------------------------------------------------------------
 
@@ -299,6 +327,8 @@ async function runConvert() {
     stitch_type: els.stitchType.value,
     stitch_len_mm: clampNum(els.stitchLen.value, 0.5, 8, 2.0),
     satin_step_mm: clampNum(els.satinStep.value, 0.15, 1.5, 0.4),
+    row_spacing_mm: clampNum(els.rowSpacing.value, 0.15, 2.0, 0.45),
+    fill_angle_deg: clampNum(els.fillAngle.value, 0, 180, 0),
     max_colors: clampInt(els.maxColors.value, 1, 8, 4),
     min_spur_len: clampInt(els.minSpur.value, 1, 60, 15),
     lock_stitches: els.lock.checked,

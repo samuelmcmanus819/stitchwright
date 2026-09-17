@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 png_to_embroidery.py — convert simple line-art PNGs into embroidery files
-(VP3 + DST), running-stitch or satin.
+(VP3 + DST), running-stitch, satin, or fill.
 
 WHAT THIS IS GOOD FOR
     Thin line art / script text / outline drawings with a handful of flat
     colors (logos, monograms, "made with love" style text, outline hearts,
     etc). It skeletonizes each color region to its centerline and stitches
-    along it.
+    along it (running/satin). Solid/filled color regions (a filled heart, a
+    bold block letter) can use fill mode instead, which scans the region
+    directly with dense parallel rows rather than following a centerline.
 
 WHAT THIS IS *NOT* GOOD FOR
-    Filled/solid shapes, photos, gradients. Those need real digitizing
-    software (Ink/Stitch, SewArt, etc).
+    Photos, gradients, and anything needing real digitizing niceties (proper
+    underlay, pull compensation, push/pull-aware digitizing). Those need
+    real digitizing software (Ink/Stitch, SewArt, etc). Fill mode here is a
+    basic raster scan-fill, not a substitute for that.
 
 VP4 NOTE
     No open-source library can currently write native VP4. This writes VP3
@@ -27,6 +31,9 @@ USAGE (command line)
 
     python3 png_to_embroidery.py input.png --out design \
         --width-mm 120 --stitch-type running --stitch-len-mm 2.0
+
+    python3 png_to_embroidery.py input.png --out design \
+        --width-mm 120 --stitch-type fill --row-spacing-mm 0.45 --fill-angle-deg 45
 
     Produces design.<fmt> for each requested format, plus design_preview.svg
     (a vector render of the stitch paths). Formats: vp3, dst, pes, jef, exp,
@@ -62,6 +69,9 @@ HOW IT WORKS
        half-width at each centerline point, and zigzag between the two
        rails (perpendicular offsets) at a fine step — this is the standard
        "column from centerline + width" approach to auto-satin.
+       Fill stitch skips the skeleton entirely and scans the raw mask with
+       closely-spaced parallel rows, connecting each row's crossings into a
+       boustrophedon path per connected region (see generate_fill()).
     6. Add small lock stitches (tie-in/tie-off) at every jump/trim boundary,
        matching normal digitizing practice, so the thread anchors properly
        instead of risking a skipped first stitch.
@@ -78,6 +88,9 @@ LIMITATIONS / KNOWN WEAK SPOTS
       source images, flatten to clean solid colors first.
     - Eulerize retraces some fragments where genuinely required by topology
       (e.g. 3-way crossings) — this is normal in real digitizing, not a bug.
+    - Fill mode has no underlay or pull compensation, and a hole/narrow
+      waist in a shape ends one run and starts another (extra trims) rather
+      than routing around it.
     - Always test-stitch on scrap fabric before running on a final piece.
 """
 
@@ -120,14 +133,27 @@ MAX_IMAGE_PIXELS = 16_000_000
 MAX_ALLOWED_COLORS = 12
 MAX_ALLOWED_SPUR_LEN = 500
 
+# extract_color_masks() fits k-means on at most this many randomly-sampled
+# ink pixels (every ink pixel is still assigned to a color afterward) -- see
+# the comment at its call site.
+COLOR_FIT_SAMPLE_SIZE = 30_000
+
 # route_fragments_eulerian() calls networkx.eulerize() per connected skeleton
 # component, which is roughly O(k^2 * (V+E) + k^3) in the number of
 # odd-degree ("junction") nodes k (all-pairs shortest paths + max-weight
-# matching over them). A busy/high-detail image can produce components with
-# hundreds of junctions, which can hang or exhaust memory. Above this many
-# odd-degree nodes, skip eulerization for that component and emit each
-# fragment as its own stitch run instead (more trims, but bounded cost).
-EULERIZE_ODD_NODE_CAP = 60
+# matching over them) -- fine for a handful of junctions, but a busy/
+# high-detail image can produce components with hundreds+, which can hang or
+# exhaust memory doing an *exact* matching. Below this cap, eulerize exactly
+# (optimal trim count). Above it, use a much cheaper greedy nearest-neighbor
+# matching instead (_greedy_eulerize(), O(k log k + k*(V+E)) — slightly more
+# retracing than the optimal matching, but no cliff in quality.
+EULERIZE_EXACT_ODD_NODE_CAP = 60
+
+# Above this many odd-degree nodes, even the greedy matching's k shortest-path
+# calls are no longer worth it -- fall back to emitting each fragment as its
+# own stitch run (more trims, but bounded cost regardless of k). This is the
+# last-resort safety net, not the common case.
+EULERIZE_GREEDY_ODD_NODE_CAP = 2_000
 
 # order_runs_greedy() now orders runs in O(n log n) (k-d tree), so this is a
 # generous sanity ceiling rather than the primary defense — it exists so a
@@ -168,16 +194,42 @@ def extract_color_masks(image_source, max_colors=4, bg_white_thresh=245, min_pix
     if len(ink_pixels) == 0:
         raise ValueError("No non-background ink pixels found in image.")
 
-    n_unique = len(np.unique(ink_pixels.round(), axis=0))
-    n_clusters = min(max_colors + 2, max(1, n_unique), len(ink_pixels))
+    # Both the unique-color count below and the k-means fit only need a
+    # bounded random sample, not every ink pixel -- np.unique(axis=0)'s row
+    # sort and kmeans2's Lloyd's-algorithm passes (iter=25) both scale with
+    # input size, and a busy/detailed image's ink pixel count can run into
+    # the millions (up to MAX_IMAGE_PIXELS). A rare color that a sample this
+    # size would miss entirely is also rare enough that min_pixel_frac would
+    # filter it out below anyway. Every ink pixel still gets assigned to a
+    # color afterward; only these two fitting steps are sampled.
+    ink_pixels = ink_pixels.astype(np.float64)
+    if len(ink_pixels) > COLOR_FIT_SAMPLE_SIZE:
+        rng = np.random.default_rng(0)
+        sample = ink_pixels[rng.choice(len(ink_pixels), COLOR_FIT_SAMPLE_SIZE, replace=False)]
+    else:
+        sample = ink_pixels
+
+    n_unique = len(np.unique(sample.round(), axis=0))
+    n_clusters = min(max_colors + 2, max(1, n_unique), len(sample))
 
     # k-means++ init with a fixed seed keeps results deterministic. scipy's
     # kmeans2 replaces scikit-learn here purely to shrink the browser payload
     # (sklearn is one of the heaviest Pyodide packages); output is equivalent
     # for the handful-of-flat-colors case this tool targets.
-    centers, labels = kmeans2(
-        ink_pixels.astype(np.float64), n_clusters, minit="++", seed=0, iter=25,
-    )
+    centers, _ = kmeans2(sample, n_clusters, minit="++", seed=0, iter=25)
+
+    # Assign every ink pixel to its nearest fitted center. A small explicit
+    # loop over clusters (n_clusters is at most max_colors + 2, a handful)
+    # keeps this O(pixels * clusters) time with O(pixels) memory, instead of
+    # materializing a full pixels-by-clusters distance matrix.
+    best_dist = np.full(len(ink_pixels), np.inf)
+    labels = np.zeros(len(ink_pixels), dtype=int)
+    for c in range(n_clusters):
+        d = ((ink_pixels - centers[c]) ** 2).sum(axis=1)
+        better = d < best_dist
+        best_dist[better] = d[better]
+        labels[better] = c
+
     labels_full = np.full(is_ink.shape, -1)
     labels_full[is_ink] = labels
 
@@ -386,6 +438,65 @@ def extract_fragments(G):
 # allows, instead of trimming at every self-crossing.
 # ---------------------------------------------------------------------------
 
+def _greedy_eulerize(sub, odd_nodes):
+    """Cheaper approximation of networkx.eulerize() for components with too
+    many odd-degree nodes for the exact algorithm to run safely (see
+    EULERIZE_EXACT_ODD_NODE_CAP): pair up odd-degree nodes by nearest
+    spatial neighbor (nodes are (y, x) pixel coordinates, matched via a k-d
+    tree) instead of an exact minimum-weight matching, then duplicate each
+    pair's shortest connecting path to flip both endpoints to even degree —
+    the same "duplicate edges to eulerize" idea nx.eulerize() uses, just
+    with a greedy match instead of an optimal one. O(k log k + k*(V+E))
+    instead of O(k^2*(V+E) + k^3), at the cost of somewhat more retracing
+    than the true optimum.
+
+    Returns an Eulerian MultiGraph, or the input unchanged if the greedy
+    pairing couldn't fully eulerize it (caller should check nx.is_eulerian
+    and fall back further)."""
+    import networkx as nx
+    from scipy.spatial import cKDTree
+
+    sub = sub.copy()
+    nodes = list(odd_nodes)
+    if len(nodes) < 2:
+        return sub
+    coords = np.array(nodes, dtype=float)
+    tree = cKDTree(coords)
+    remaining = set(range(len(nodes)))
+
+    while len(remaining) >= 2:
+        i = next(iter(remaining))
+        remaining.discard(i)
+        k = 2
+        j = None
+        while j is None:
+            k = min(k, len(nodes))
+            _, idxs = tree.query(coords[i], k=k)
+            for cand in np.atleast_1d(idxs):
+                cand = int(cand)
+                if cand != i and cand in remaining:
+                    j = cand
+                    break
+            if j is None:
+                if k >= len(nodes):
+                    break
+                k *= 2
+        if j is None:
+            break
+        remaining.discard(j)
+
+        u, v = nodes[i], nodes[j]
+        try:
+            path = nx.shortest_path(sub, u, v)
+        except nx.NetworkXNoPath:
+            continue
+        for a, b in zip(path[:-1], path[1:]):
+            edge_data = sub.get_edge_data(a, b)
+            key0 = next(iter(edge_data))
+            sub.add_edge(a, b, **edge_data[key0])
+    return sub
+
+
 def route_fragments_eulerian(fragments):
     """fragments: list of pixel-paths (each a list of (y,x)).
     Returns: list of routed pixel-paths, one per connected component,
@@ -409,14 +520,24 @@ def route_fragments_eulerian(fragments):
             continue
 
         odd_nodes = [n for n, d in sub.degree() if d % 2 == 1]
-        if not nx.is_eulerian(sub) and len(odd_nodes) > EULERIZE_ODD_NODE_CAP:
-            # Too many junctions to eulerize safely (see EULERIZE_ODD_NODE_CAP) —
-            # fall back to one run per fragment instead of a single routed
-            # circuit. More trims, but bounded cost on busy/complex art.
-            log(
-                f"  component has {len(odd_nodes)} junctions (>{EULERIZE_ODD_NODE_CAP}); "
-                "skipping eulerization, routing fragments separately"
-            )
+        n_odd = len(odd_nodes)
+        sub_e = sub
+
+        if not nx.is_eulerian(sub):
+            if n_odd <= EULERIZE_EXACT_ODD_NODE_CAP:
+                sub_e = nx.eulerize(sub)
+            elif n_odd <= EULERIZE_GREEDY_ODD_NODE_CAP:
+                log(f"  component has {n_odd} junctions (>{EULERIZE_EXACT_ODD_NODE_CAP}); "
+                    "using greedy eulerization instead of exact matching")
+                sub_e = _greedy_eulerize(sub, odd_nodes)
+
+        if not nx.is_eulerian(sub_e):
+            # Too complex to eulerize safely even with the greedy matching
+            # (see EULERIZE_GREEDY_ODD_NODE_CAP) — fall back to one run per
+            # fragment instead of a single routed circuit. More trims, but
+            # bounded cost on busy/complex art.
+            log(f"  component has {n_odd} junctions (>{EULERIZE_GREEDY_ODD_NODE_CAP}); "
+                "skipping eulerization, routing fragments separately")
             for u, v, k, data in sub.edges(keys=True, data=True):
                 idx = data.get("idx")
                 if idx is None:
@@ -426,7 +547,6 @@ def route_fragments_eulerian(fragments):
                     routed.append(frag)
             continue
 
-        sub_e = sub if nx.is_eulerian(sub) else nx.eulerize(sub)
         circuit = list(nx.eulerian_circuit(sub_e, keys=True, source=list(sub_e.nodes())[0]))
 
         path_pts = []
@@ -537,11 +657,150 @@ def generate_satin(path_px, mask, scale_mm_per_px, satin_step_mm=0.4, width_scal
 
 
 # ---------------------------------------------------------------------------
+# Fill (tatami) stitch generation: dense parallel rows covering a solid mask
+# region directly (not its skeleton) -- for filled shapes rather than thin
+# strokes.
+# ---------------------------------------------------------------------------
+
+def _row_runs(row_bool):
+    """row_bool: 1-D boolean array. Returns [(x0, x1), ...] inclusive pixel
+    ranges of contiguous True runs, left to right."""
+    idx = np.flatnonzero(row_bool)
+    if idx.size == 0:
+        return []
+    splits = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.concatenate(([0], splits + 1))
+    ends = np.concatenate((splits, [idx.size - 1]))
+    return [(int(idx[s]), int(idx[e])) for s, e in zip(starts, ends)]
+
+
+def _append_row_stitches(pts, x_from, x_to, y, stitch_len_px):
+    """Subdivide a row crossing from x_from to x_to into ~stitch_len_px
+    spaced points (excluding x_from itself, which the caller already
+    appended) so a fill pass feeds like real machine stitches instead of one
+    very long stitch per row."""
+    n = max(1, int(round(abs(x_to - x_from) / stitch_len_px)))
+    for i in range(1, n + 1):
+        t = i / n
+        pts.append((x_from + (x_to - x_from) * t, float(y)))
+
+
+def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0, angle_deg=0.0):
+    """Tatami-style fill: scan the mask with closely-spaced parallel rows
+    (perpendicular to `angle_deg`) and connect each row's crossings into a
+    boustrophedon (back-and-forth) path per connected mask region, so one
+    filled shape stitches as a single continuous run instead of jumping at
+    every row. Holes and disjoint islands naturally end/split runs, since a
+    row crossing a hole produces separate segments that can't be joined
+    without stitching over empty fabric.
+
+    Returns: list of (N, 2) arrays of (x, y) points in original mask pixel
+    space, one array per continuous fill run.
+    """
+    from scipy.ndimage import rotate, label
+
+    h, w = mask.shape
+    if h == 0 or w == 0 or not mask.any():
+        return []
+
+    # Rotate the mask and a matching pair of coordinate-grid "channels" by
+    # the same transform, so that after scanning horizontal rows in rotated
+    # space, each row-point's original-space (x, y) can be read straight off
+    # the rotated coordinate channels -- this sidesteps re-deriving
+    # scipy.ndimage.rotate's own rotation matrix/center/padding by hand.
+    if abs(angle_deg) < 1e-6:
+        rot_mask = mask
+        yy, xx = np.mgrid[0:h, 0:w]
+        rot_x, rot_y = xx.astype(float), yy.astype(float)
+    else:
+        yy, xx = np.mgrid[0:h, 0:w].astype(float)
+        rot_mask = rotate(mask.astype(float), angle_deg, reshape=True, order=1, cval=0.0) > 0.5
+        rot_x = rotate(xx, angle_deg, reshape=True, order=1, cval=-1e6)
+        rot_y = rotate(yy, angle_deg, reshape=True, order=1, cval=-1e6)
+
+    if not rot_mask.any():
+        return []
+
+    rh, rw = rot_mask.shape
+    row_spacing_px = max(row_spacing_mm / scale_mm_per_px, 1.0)
+    stitch_len_px = max(stitch_len_mm / scale_mm_per_px, 1.0)
+    row_ys = np.unique(np.round(np.arange(0, rh, row_spacing_px)).astype(int))
+    row_ys = row_ys[row_ys < rh]
+
+    labeled, n_comp = label(rot_mask)
+
+    runs_rotated = []
+    for comp_id in range(1, n_comp + 1):
+        comp_mask = labeled == comp_id
+        active = []  # [{"prev": (x0, x1), "pts": [(x, y), ...]}, ...]
+        finished = []
+        for yi in row_ys:
+            runs = _row_runs(comp_mask[yi])
+            if not runs:
+                finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
+                active = []
+                continue
+
+            matched = [False] * len(runs)
+            new_active = []
+            for a in active:
+                best_i, best_overlap = None, 0
+                for i, r in enumerate(runs):
+                    if matched[i]:
+                        continue
+                    ov = min(a["prev"][1], r[1]) - max(a["prev"][0], r[0])
+                    if ov > best_overlap:
+                        best_overlap, best_i = ov, i
+                if best_i is None:
+                    if len(a["pts"]) >= 2:
+                        finished.append(a["pts"])
+                    continue
+                matched[best_i] = True
+                r = runs[best_i]
+                last_x = a["pts"][-1][0]
+                start, end = (r[0], r[1]) if abs(r[0] - last_x) <= abs(r[1] - last_x) else (r[1], r[0])
+                a["pts"].append((float(start), float(yi)))
+                _append_row_stitches(a["pts"], start, end, yi, stitch_len_px)
+                a["prev"] = r
+                new_active.append(a)
+
+            for i, r in enumerate(runs):
+                if matched[i]:
+                    continue
+                pts = [(float(r[0]), float(yi))]
+                _append_row_stitches(pts, r[0], r[1], yi, stitch_len_px)
+                new_active.append({"prev": r, "pts": pts})
+
+            active = new_active
+        finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
+        runs_rotated.extend(finished)
+
+    out = []
+    for pts in runs_rotated:
+        arr = np.array(pts, dtype=float)
+        xs = np.clip(arr[:, 0].round().astype(int), 0, rw - 1)
+        ys = np.clip(arr[:, 1].round().astype(int), 0, rh - 1)
+        orig_x = rot_x[ys, xs]
+        orig_y = rot_y[ys, xs]
+        valid = orig_x > -1e5
+        if valid.sum() >= 2:
+            out.append(np.stack([orig_x[valid], orig_y[valid]], axis=1))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Per-color processing
 # ---------------------------------------------------------------------------
 
 def process_color_mask(mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
-                        min_spur_len=15):
+                        min_spur_len=15, row_spacing_mm=0.45, fill_angle_deg=0.0):
+    if stitch_type == "fill":
+        fill_runs = generate_fill(
+            mask, scale_mm_per_px, row_spacing_mm=row_spacing_mm,
+            stitch_len_mm=stitch_len_mm, angle_deg=fill_angle_deg,
+        )
+        return [[pts] for pts in fill_runs]
+
     G, _ = skeleton_to_graph(mask)
     G = prune_spurs(G, min_len=min_spur_len)
     G = merge_close_junctions(G)
@@ -724,6 +983,8 @@ def convert(
     stitch_type="running",
     stitch_len_mm=2.0,
     satin_step_mm=0.4,
+    row_spacing_mm=0.45,
+    fill_angle_deg=0.0,
     max_colors=4,
     min_spur_len=15,
     lock_stitches=True,
@@ -759,10 +1020,12 @@ def convert(
             f"Unsupported output format(s): {', '.join(unknown)}. "
             f"Choose from: {', '.join(sorted(SUPPORTED_FORMATS))}."
         )
-    if stitch_type not in ("running", "satin"):
-        raise ConversionError("stitch_type must be 'running' or 'satin'.")
+    if stitch_type not in ("running", "satin", "fill"):
+        raise ConversionError("stitch_type must be 'running', 'satin', or 'fill'.")
     if width_mm <= 0:
         raise ConversionError("width_mm must be positive.")
+    if stitch_type == "fill" and row_spacing_mm <= 0:
+        raise ConversionError("row_spacing_mm must be positive.")
     if not (1 <= max_colors <= MAX_ALLOWED_COLORS):
         raise ConversionError(f"max_colors must be between 1 and {MAX_ALLOWED_COLORS}.")
     if not (0 <= min_spur_len <= MAX_ALLOWED_SPUR_LEN):
@@ -785,7 +1048,8 @@ def convert(
         try:
             runs = process_color_mask(
                 mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
-                min_spur_len=min_spur_len,
+                min_spur_len=min_spur_len, row_spacing_mm=row_spacing_mm,
+                fill_angle_deg=fill_angle_deg,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one bad color, not the whole image
             log(f"  -> skipped color {color}: {exc}")
@@ -842,9 +1106,11 @@ def main():
     ap.add_argument("input_png")
     ap.add_argument("--out", default="design", help="output filename prefix")
     ap.add_argument("--width-mm", type=float, default=120.0, help="design width in mm")
-    ap.add_argument("--stitch-type", choices=["running", "satin"], default="running")
-    ap.add_argument("--stitch-len-mm", type=float, default=2.0, help="running-stitch spacing in mm")
+    ap.add_argument("--stitch-type", choices=["running", "satin", "fill"], default="running")
+    ap.add_argument("--stitch-len-mm", type=float, default=2.0, help="running-stitch spacing / fill row-crossing subdivision in mm")
     ap.add_argument("--satin-step-mm", type=float, default=0.4, help="satin zigzag step in mm")
+    ap.add_argument("--row-spacing-mm", type=float, default=0.45, help="fill stitch row spacing in mm (fill mode only)")
+    ap.add_argument("--fill-angle-deg", type=float, default=0.0, help="fill stitch row angle in degrees (fill mode only)")
     ap.add_argument("--max-colors", type=int, default=4, help="max distinct thread colors to detect")
     ap.add_argument("--min-spur-len", type=int, default=15, help="skeleton spur-pruning threshold in px")
     ap.add_argument("--no-lock-stitches", action="store_true", help="disable tie-in/tie-off lock stitches")
@@ -864,6 +1130,8 @@ def main():
             stitch_type=args.stitch_type,
             stitch_len_mm=args.stitch_len_mm,
             satin_step_mm=args.satin_step_mm,
+            row_spacing_mm=args.row_spacing_mm,
+            fill_angle_deg=args.fill_angle_deg,
             max_colors=args.max_colors,
             min_spur_len=args.min_spur_len,
             lock_stitches=not args.no_lock_stitches,
