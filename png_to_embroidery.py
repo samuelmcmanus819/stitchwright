@@ -775,14 +775,17 @@ def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0,
     (`underlay_row_spacing_mm`) -- this tacks the fabric down before the
     dense top layer instead of letting it flex under it. Without underlay,
     that flex is a real cause of tension-related thread nesting on the
-    back, and it gets worse the denser the top fill is. The underlay pass
-    is stitched as one continuous thread path directly into that region's
-    top fill (no trim in between), matching normal digitizing practice.
+    back, and it gets worse the denser the top fill is. Underlay paths for
+    a region are emitted immediately before that region's top-fill paths so
+    downstream run-ordering keeps them close together, but -- like any two
+    disjoint fill paths -- each is still its own separate run with its own
+    trim: gluing unrelated paths into one continuous stitch would draw a
+    straight stray line across the shape between their endpoints, which is
+    exactly the kind of artifact fill mode's "extra trims rather than
+    stitching over a gap" rule exists to avoid.
 
-    Returns: list of "runs", one per connected mask region, each a list of
-    (N, 2) arrays of (x, y) points in original mask pixel space -- the
-    region's underlay path(s) (if any) followed by its top-fill path(s), in
-    stitch order.
+    Returns: list of (N, 2) arrays of (x, y) points in original mask pixel
+    space, one array per continuous run (underlay or top-fill).
     """
     from scipy.ndimage import rotate, label
 
@@ -822,30 +825,25 @@ def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0,
 
     labeled, n_comp = label(rot_mask)
 
-    runs_rotated = []  # one entry per region: [underlay path(s)..., fill path(s)...]
+    runs_rotated = []  # flat: underlay path(s) for a region, then that region's
+                        # fill path(s), then the next region's, and so on --
+                        # kept adjacent for ordering, never merged into one path
     for comp_id in range(1, n_comp + 1):
         comp_mask = labeled == comp_id
-        region_paths = []
         if underlay and len(underlay_xs):
-            region_paths.extend(_scan_component(comp_mask, underlay_xs, stitch_len_px, transpose=True))
-        region_paths.extend(_scan_component(comp_mask, row_ys, stitch_len_px, transpose=False))
-        if region_paths:
-            runs_rotated.append(region_paths)
+            runs_rotated.extend(_scan_component(comp_mask, underlay_xs, stitch_len_px, transpose=True))
+        runs_rotated.extend(_scan_component(comp_mask, row_ys, stitch_len_px, transpose=False))
 
     out = []
-    for region_paths in runs_rotated:
-        mapped = []
-        for pts in region_paths:
-            arr = np.array(pts, dtype=float)
-            xs = np.clip(arr[:, 0].round().astype(int), 0, rw - 1)
-            ys = np.clip(arr[:, 1].round().astype(int), 0, rh - 1)
-            orig_x = rot_x[ys, xs]
-            orig_y = rot_y[ys, xs]
-            valid = orig_x > -1e5
-            if valid.sum() >= 2:
-                mapped.append(np.stack([orig_x[valid], orig_y[valid]], axis=1))
-        if mapped:
-            out.append(mapped)
+    for pts in runs_rotated:
+        arr = np.array(pts, dtype=float)
+        xs = np.clip(arr[:, 0].round().astype(int), 0, rw - 1)
+        ys = np.clip(arr[:, 1].round().astype(int), 0, rh - 1)
+        orig_x = rot_x[ys, xs]
+        orig_y = rot_y[ys, xs]
+        valid = orig_x > -1e5
+        if valid.sum() >= 2:
+            out.append(np.stack([orig_x[valid], orig_y[valid]], axis=1))
     return out
 
 
@@ -857,11 +855,12 @@ def process_color_mask(mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_
                         min_spur_len=15, row_spacing_mm=0.45, fill_angle_deg=0.0,
                         fill_underlay=True, underlay_row_spacing_mm=DEFAULT_UNDERLAY_ROW_SPACING_MM):
     if stitch_type == "fill":
-        return generate_fill(
+        fill_runs = generate_fill(
             mask, scale_mm_per_px, row_spacing_mm=row_spacing_mm,
             stitch_len_mm=stitch_len_mm, angle_deg=fill_angle_deg,
             underlay=fill_underlay, underlay_row_spacing_mm=underlay_row_spacing_mm,
         )
+        return [[pts] for pts in fill_runs]
 
     G, _ = skeleton_to_graph(mask)
     G = prune_spurs(G, min_len=min_spur_len)
