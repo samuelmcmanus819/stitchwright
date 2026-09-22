@@ -705,6 +705,42 @@ def _append_scan_stitches(pts, along_from, along_to, fixed, stitch_len_px, trans
         pts.append((fixed, along) if transpose else (along, fixed))
 
 
+def _bridge_stays_inside(check_mask, p0, p1, min_frac=0.85):
+    """Whether the straight line from p0 to p1 (both (x, y) mask-pixel
+    coordinates) stays inside check_mask. The row/column overlap check in
+    _scan_component only compares crossing *ranges* between two scan
+    slices; it says nothing about whether the mask is actually filled in
+    between them. When two separate strokes run close together, a slice
+    can flip from tracking one stroke to the other while their ranges
+    still happen to overlap, and the overlap check alone would accept that
+    as a continuation -- bridging the two with a stitch straight across the
+    real gap between them. Sampling roughly per-pixel along the candidate
+    bridge (capped for very long bridges) catches that: a genuine gap is
+    real background, and per-pixel sampling won't step over it.
+
+    check_mask should be a slightly dilated copy of the region mask, not
+    the raw mask: a plain convex shape's raster boundary is a staircase,
+    not a smooth curve, so a straight line between two genuinely-inside
+    boundary pixels can still graze a single-pixel staircase notch even
+    though nothing is topologically wrong. Dilating by a pixel absorbs
+    that noise while a real gap (several background pixels wide, since
+    that's what makes two strokes look "separate" at all) still fails.
+    """
+    h, w = check_mask.shape
+    x0, y0 = p0
+    x1, y1 = p1
+    dist = max(abs(x1 - x0), abs(y1 - y0))
+    n_samples = int(np.clip(round(dist), 4, 200))
+    inside = 0
+    for k in range(1, n_samples):
+        t = k / n_samples
+        x = int(round(x0 + (x1 - x0) * t))
+        y = int(round(y0 + (y1 - y0) * t))
+        if 0 <= y < h and 0 <= x < w and check_mask[y, x]:
+            inside += 1
+    return inside >= min_frac * (n_samples - 1)
+
+
 def _scan_component(comp_mask, positions, stitch_len_px, transpose=False):
     """Scan comp_mask along `positions` (row indices, or column indices when
     transpose=True) and connect each slice's crossings into boustrophedon
@@ -715,7 +751,10 @@ def _scan_component(comp_mask, positions, stitch_len_px, transpose=False):
 
     Returns a list of point-lists in (x, y) mask-pixel coordinates.
     """
+    from scipy.ndimage import binary_dilation
+
     scan = comp_mask.T if transpose else comp_mask
+    bridge_check_mask = binary_dilation(comp_mask, iterations=1)
     active = []  # [{"prev": (a0, a1), "pts": [(x, y), ...]}, ...]
     finished = []
     for i in positions:
@@ -743,7 +782,19 @@ def _scan_component(comp_mask, positions, stitch_len_px, transpose=False):
             r = runs[best_j]
             last_along = a["pts"][-1][1 if transpose else 0]
             start, end = (r[0], r[1]) if abs(r[0] - last_along) <= abs(r[1] - last_along) else (r[1], r[0])
-            a["pts"].append((i, float(start)) if transpose else (float(start), i))
+            candidate = (i, float(start)) if transpose else (float(start), i)
+            if not _bridge_stays_inside(bridge_check_mask, a["pts"][-1], candidate):
+                # Overlap said "same feature", but the straight line between
+                # them actually crosses empty fabric -- these are two
+                # different, merely nearby, features. End the old path here
+                # and let `r` start a brand new one instead of bridging.
+                if len(a["pts"]) >= 2:
+                    finished.append(a["pts"])
+                pts = [candidate]
+                _append_scan_stitches(pts, start, end, i, stitch_len_px, transpose)
+                new_active.append({"prev": r, "pts": pts})
+                continue
+            a["pts"].append(candidate)
             _append_scan_stitches(a["pts"], start, end, i, stitch_len_px, transpose)
             a["prev"] = r
             new_active.append(a)
