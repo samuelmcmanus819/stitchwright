@@ -71,7 +71,9 @@ HOW IT WORKS
        "column from centerline + width" approach to auto-satin.
        Fill stitch skips the skeleton entirely and scans the raw mask with
        closely-spaced parallel rows, connecting each row's crossings into a
-       boustrophedon path per connected region (see generate_fill()).
+       boustrophedon path per connected region, after first laying down a
+       light perpendicular underlay pass to tack the fabric down (see
+       generate_fill()).
     6. Add small lock stitches (tie-in/tie-off) at every jump/trim boundary,
        matching normal digitizing practice, so the thread anchors properly
        instead of risking a skipped first stitch.
@@ -88,9 +90,9 @@ LIMITATIONS / KNOWN WEAK SPOTS
       source images, flatten to clean solid colors first.
     - Eulerize retraces some fragments where genuinely required by topology
       (e.g. 3-way crossings) — this is normal in real digitizing, not a bug.
-    - Fill mode has no underlay or pull compensation, and a hole/narrow
-      waist in a shape ends one run and starts another (extra trims) rather
-      than routing around it.
+    - Fill mode's underlay is a single perpendicular pass, not real
+      push/pull compensation, and a hole/narrow waist in a shape ends one
+      run and starts another (extra trims) rather than routing around it.
     - Always test-stitch on scrap fabric before running on a final piece.
 """
 
@@ -119,6 +121,12 @@ SUPPORTED_FORMATS = {
 }
 
 DEFAULT_FORMATS = ("vp3", "dst")
+
+# Fill-mode underlay row spacing: much wider than any reasonable top-fill
+# row_spacing_mm, since underlay just needs to tack the fabric down, not
+# add coverage. Independent of row_spacing_mm so a denser top fill doesn't
+# silently drag underlay density along with it.
+DEFAULT_UNDERLAY_ROW_SPACING_MM = 3.0
 
 # Safety cap on total input-image pixels. skeleton_to_graph() puts one
 # networkx node per skeleton pixel and extract_color_masks() k-means-clusters
@@ -674,18 +682,86 @@ def _row_runs(row_bool):
     return [(int(idx[s]), int(idx[e])) for s, e in zip(starts, ends)]
 
 
-def _append_row_stitches(pts, x_from, x_to, y, stitch_len_px):
-    """Subdivide a row crossing from x_from to x_to into ~stitch_len_px
-    spaced points (excluding x_from itself, which the caller already
-    appended) so a fill pass feeds like real machine stitches instead of one
-    very long stitch per row."""
-    n = max(1, int(round(abs(x_to - x_from) / stitch_len_px)))
+def _append_scan_stitches(pts, along_from, along_to, fixed, stitch_len_px, transpose):
+    """Subdivide a row/column crossing from along_from to along_to into
+    ~stitch_len_px spaced points (excluding along_from itself, which the
+    caller already appended) so a fill pass feeds like real machine
+    stitches instead of one very long stitch per row. `transpose` selects
+    whether (along, fixed) map to (x, y) [row scan] or (y, x) [column scan].
+
+    Skips entirely when along_to == along_from (a single-pixel-wide
+    crossing, common at the tapered tip of a filled shape): the caller
+    already appended that exact point, so subdividing it would add a
+    zero-length stitch on top of one already there -- the needle punching
+    the same spot twice in a row is a real, avoidable contributor to thread
+    build-up/nesting on the back.
+    """
+    if along_to == along_from:
+        return
+    n = max(1, int(round(abs(along_to - along_from) / stitch_len_px)))
     for i in range(1, n + 1):
         t = i / n
-        pts.append((x_from + (x_to - x_from) * t, float(y)))
+        along = along_from + (along_to - along_from) * t
+        pts.append((fixed, along) if transpose else (along, fixed))
 
 
-def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0, angle_deg=0.0):
+def _scan_component(comp_mask, positions, stitch_len_px, transpose=False):
+    """Scan comp_mask along `positions` (row indices, or column indices when
+    transpose=True) and connect each slice's crossings into boustrophedon
+    (back-and-forth) point paths. Scanning columns instead of rows over the
+    same (already rotated) mask gives a direction perpendicular to whatever
+    the caller used for rows, without a second mask rotation -- this is how
+    generate_fill() produces a perpendicular underlay pass per region.
+
+    Returns a list of point-lists in (x, y) mask-pixel coordinates.
+    """
+    scan = comp_mask.T if transpose else comp_mask
+    active = []  # [{"prev": (a0, a1), "pts": [(x, y), ...]}, ...]
+    finished = []
+    for i in positions:
+        runs = _row_runs(scan[i])
+        if not runs:
+            finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
+            active = []
+            continue
+
+        matched = [False] * len(runs)
+        new_active = []
+        for a in active:
+            best_j, best_overlap = None, 0
+            for j, r in enumerate(runs):
+                if matched[j]:
+                    continue
+                ov = min(a["prev"][1], r[1]) - max(a["prev"][0], r[0])
+                if ov > best_overlap:
+                    best_overlap, best_j = ov, j
+            if best_j is None:
+                if len(a["pts"]) >= 2:
+                    finished.append(a["pts"])
+                continue
+            matched[best_j] = True
+            r = runs[best_j]
+            last_along = a["pts"][-1][1 if transpose else 0]
+            start, end = (r[0], r[1]) if abs(r[0] - last_along) <= abs(r[1] - last_along) else (r[1], r[0])
+            a["pts"].append((i, float(start)) if transpose else (float(start), i))
+            _append_scan_stitches(a["pts"], start, end, i, stitch_len_px, transpose)
+            a["prev"] = r
+            new_active.append(a)
+
+        for j, r in enumerate(runs):
+            if matched[j]:
+                continue
+            pts = [(i, float(r[0])) if transpose else (float(r[0]), i)]
+            _append_scan_stitches(pts, r[0], r[1], i, stitch_len_px, transpose)
+            new_active.append({"prev": r, "pts": pts})
+
+        active = new_active
+    finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
+    return finished
+
+
+def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0, angle_deg=0.0,
+                   underlay=True, underlay_row_spacing_mm=DEFAULT_UNDERLAY_ROW_SPACING_MM):
     """Tatami-style fill: scan the mask with closely-spaced parallel rows
     (perpendicular to `angle_deg`) and connect each row's crossings into a
     boustrophedon (back-and-forth) path per connected mask region, so one
@@ -694,8 +770,19 @@ def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0,
     row crossing a hole produces separate segments that can't be joined
     without stitching over empty fabric.
 
-    Returns: list of (N, 2) arrays of (x, y) points in original mask pixel
-    space, one array per continuous fill run.
+    When `underlay` is True (default), each region is first stitched with a
+    light pass perpendicular to the top-fill rows, at much wider spacing
+    (`underlay_row_spacing_mm`) -- this tacks the fabric down before the
+    dense top layer instead of letting it flex under it. Without underlay,
+    that flex is a real cause of tension-related thread nesting on the
+    back, and it gets worse the denser the top fill is. The underlay pass
+    is stitched as one continuous thread path directly into that region's
+    top fill (no trim in between), matching normal digitizing practice.
+
+    Returns: list of "runs", one per connected mask region, each a list of
+    (N, 2) arrays of (x, y) points in original mask pixel space -- the
+    region's underlay path(s) (if any) followed by its top-fill path(s), in
+    stitch order.
     """
     from scipy.ndimage import rotate, label
 
@@ -727,64 +814,38 @@ def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0,
     row_ys = np.unique(np.round(np.arange(0, rh, row_spacing_px)).astype(int))
     row_ys = row_ys[row_ys < rh]
 
+    underlay_xs = np.array([], dtype=int)
+    if underlay:
+        underlay_spacing_px = max(underlay_row_spacing_mm / scale_mm_per_px, 1.0)
+        underlay_xs = np.unique(np.round(np.arange(0, rw, underlay_spacing_px)).astype(int))
+        underlay_xs = underlay_xs[underlay_xs < rw]
+
     labeled, n_comp = label(rot_mask)
 
-    runs_rotated = []
+    runs_rotated = []  # one entry per region: [underlay path(s)..., fill path(s)...]
     for comp_id in range(1, n_comp + 1):
         comp_mask = labeled == comp_id
-        active = []  # [{"prev": (x0, x1), "pts": [(x, y), ...]}, ...]
-        finished = []
-        for yi in row_ys:
-            runs = _row_runs(comp_mask[yi])
-            if not runs:
-                finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
-                active = []
-                continue
-
-            matched = [False] * len(runs)
-            new_active = []
-            for a in active:
-                best_i, best_overlap = None, 0
-                for i, r in enumerate(runs):
-                    if matched[i]:
-                        continue
-                    ov = min(a["prev"][1], r[1]) - max(a["prev"][0], r[0])
-                    if ov > best_overlap:
-                        best_overlap, best_i = ov, i
-                if best_i is None:
-                    if len(a["pts"]) >= 2:
-                        finished.append(a["pts"])
-                    continue
-                matched[best_i] = True
-                r = runs[best_i]
-                last_x = a["pts"][-1][0]
-                start, end = (r[0], r[1]) if abs(r[0] - last_x) <= abs(r[1] - last_x) else (r[1], r[0])
-                a["pts"].append((float(start), float(yi)))
-                _append_row_stitches(a["pts"], start, end, yi, stitch_len_px)
-                a["prev"] = r
-                new_active.append(a)
-
-            for i, r in enumerate(runs):
-                if matched[i]:
-                    continue
-                pts = [(float(r[0]), float(yi))]
-                _append_row_stitches(pts, r[0], r[1], yi, stitch_len_px)
-                new_active.append({"prev": r, "pts": pts})
-
-            active = new_active
-        finished.extend(a["pts"] for a in active if len(a["pts"]) >= 2)
-        runs_rotated.extend(finished)
+        region_paths = []
+        if underlay and len(underlay_xs):
+            region_paths.extend(_scan_component(comp_mask, underlay_xs, stitch_len_px, transpose=True))
+        region_paths.extend(_scan_component(comp_mask, row_ys, stitch_len_px, transpose=False))
+        if region_paths:
+            runs_rotated.append(region_paths)
 
     out = []
-    for pts in runs_rotated:
-        arr = np.array(pts, dtype=float)
-        xs = np.clip(arr[:, 0].round().astype(int), 0, rw - 1)
-        ys = np.clip(arr[:, 1].round().astype(int), 0, rh - 1)
-        orig_x = rot_x[ys, xs]
-        orig_y = rot_y[ys, xs]
-        valid = orig_x > -1e5
-        if valid.sum() >= 2:
-            out.append(np.stack([orig_x[valid], orig_y[valid]], axis=1))
+    for region_paths in runs_rotated:
+        mapped = []
+        for pts in region_paths:
+            arr = np.array(pts, dtype=float)
+            xs = np.clip(arr[:, 0].round().astype(int), 0, rw - 1)
+            ys = np.clip(arr[:, 1].round().astype(int), 0, rh - 1)
+            orig_x = rot_x[ys, xs]
+            orig_y = rot_y[ys, xs]
+            valid = orig_x > -1e5
+            if valid.sum() >= 2:
+                mapped.append(np.stack([orig_x[valid], orig_y[valid]], axis=1))
+        if mapped:
+            out.append(mapped)
     return out
 
 
@@ -793,13 +854,14 @@ def generate_fill(mask, scale_mm_per_px, row_spacing_mm=0.45, stitch_len_mm=3.0,
 # ---------------------------------------------------------------------------
 
 def process_color_mask(mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
-                        min_spur_len=15, row_spacing_mm=0.45, fill_angle_deg=0.0):
+                        min_spur_len=15, row_spacing_mm=0.45, fill_angle_deg=0.0,
+                        fill_underlay=True, underlay_row_spacing_mm=DEFAULT_UNDERLAY_ROW_SPACING_MM):
     if stitch_type == "fill":
-        fill_runs = generate_fill(
+        return generate_fill(
             mask, scale_mm_per_px, row_spacing_mm=row_spacing_mm,
             stitch_len_mm=stitch_len_mm, angle_deg=fill_angle_deg,
+            underlay=fill_underlay, underlay_row_spacing_mm=underlay_row_spacing_mm,
         )
-        return [[pts] for pts in fill_runs]
 
     G, _ = skeleton_to_graph(mask)
     G = prune_spurs(G, min_len=min_spur_len)
@@ -985,6 +1047,8 @@ def convert(
     satin_step_mm=0.4,
     row_spacing_mm=0.45,
     fill_angle_deg=0.0,
+    fill_underlay=True,
+    underlay_row_spacing_mm=DEFAULT_UNDERLAY_ROW_SPACING_MM,
     max_colors=4,
     min_spur_len=15,
     lock_stitches=True,
@@ -1026,6 +1090,8 @@ def convert(
         raise ConversionError("width_mm must be positive.")
     if stitch_type == "fill" and row_spacing_mm <= 0:
         raise ConversionError("row_spacing_mm must be positive.")
+    if stitch_type == "fill" and fill_underlay and underlay_row_spacing_mm <= 0:
+        raise ConversionError("underlay_row_spacing_mm must be positive.")
     if not (1 <= max_colors <= MAX_ALLOWED_COLORS):
         raise ConversionError(f"max_colors must be between 1 and {MAX_ALLOWED_COLORS}.")
     if not (0 <= min_spur_len <= MAX_ALLOWED_SPUR_LEN):
@@ -1049,7 +1115,8 @@ def convert(
             runs = process_color_mask(
                 mask, scale_mm_per_px, stitch_type, stitch_len_mm, satin_step_mm,
                 min_spur_len=min_spur_len, row_spacing_mm=row_spacing_mm,
-                fill_angle_deg=fill_angle_deg,
+                fill_angle_deg=fill_angle_deg, fill_underlay=fill_underlay,
+                underlay_row_spacing_mm=underlay_row_spacing_mm,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one bad color, not the whole image
             log(f"  -> skipped color {color}: {exc}")
@@ -1111,6 +1178,8 @@ def main():
     ap.add_argument("--satin-step-mm", type=float, default=0.4, help="satin zigzag step in mm")
     ap.add_argument("--row-spacing-mm", type=float, default=0.45, help="fill stitch row spacing in mm (fill mode only)")
     ap.add_argument("--fill-angle-deg", type=float, default=0.0, help="fill stitch row angle in degrees (fill mode only)")
+    ap.add_argument("--no-fill-underlay", action="store_true", help="disable the perpendicular underlay pass under fill regions (fill mode only)")
+    ap.add_argument("--underlay-row-spacing-mm", type=float, default=DEFAULT_UNDERLAY_ROW_SPACING_MM, help="fill underlay row spacing in mm (fill mode only)")
     ap.add_argument("--max-colors", type=int, default=4, help="max distinct thread colors to detect")
     ap.add_argument("--min-spur-len", type=int, default=15, help="skeleton spur-pruning threshold in px")
     ap.add_argument("--no-lock-stitches", action="store_true", help="disable tie-in/tie-off lock stitches")
@@ -1132,6 +1201,8 @@ def main():
             satin_step_mm=args.satin_step_mm,
             row_spacing_mm=args.row_spacing_mm,
             fill_angle_deg=args.fill_angle_deg,
+            fill_underlay=not args.no_fill_underlay,
+            underlay_row_spacing_mm=args.underlay_row_spacing_mm,
             max_colors=args.max_colors,
             min_spur_len=args.min_spur_len,
             lock_stitches=not args.no_lock_stitches,
